@@ -16,34 +16,19 @@
  * fields enclosed by brackets "[]" replaced with your own identifying
  * information: Portions Copyright [yyyy] [name of copyright owner]
  *
+ * Copyright 2014 Brendon Humphrey (brendon.humphrey@mac.com)
+ *
  * CDDL HEADER END
  */
 
-#ifndef MEMORY_POOL_H
-#define MEMORY_POOL_H
+#ifndef BMALLOC_H
+#define BMALLOC_H
 
-#include "osif.h"
-
-struct memory_block;
-
-typedef struct memory_block {
-    struct memory_block* next;
-    struct memory_block* prev;
-    hrtime_t             time_freed;
-} memory_block;
-
-
-void memory_pool_init();
-void memory_pool_fini();
-
-sa_size_t memory_pool_claim_size();
-
-void* memory_pool_claim();
-void memory_pool_return(void* memory);
-
-void memory_pool_release_memory();
-void memory_pool_garbage_collect();
-
-
+void bmalloc_init();
+void* bmalloc(size_t size);
+void bfree(void* buf, size_t size);
+void bmalloc_release_memory();
+void bmalloc_garbage_collect();
+void bmalloc_fini();
 
 #endif
