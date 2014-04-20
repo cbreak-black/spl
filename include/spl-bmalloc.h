@@ -24,11 +24,38 @@
 #ifndef BMALLOC_H
 #define BMALLOC_H
 
+//
+// Initialises the allocator, must be called before any other function.
+//
 void bmalloc_init();
+
+//
+// Allocate <size> bytes of memory for the application
+//
 void* bmalloc(size_t size);
+
+//
+// Release memory from the application
+//
 void bfree(void* buf, size_t size);
+
+//
+// Release all free memory within the allocator
+// Should be invoked if the machine is under
+// memory pressure.
+//
 void bmalloc_release_memory();
+
+//
+// Manages from free memory within the allocator.
+// Should be called periodically (say at least
+// every 10 seconds).
+//
 void bmalloc_garbage_collect();
+
+//
+// Release all remaining memory and allocator resources
+//
 void bmalloc_fini();
 
 #endif

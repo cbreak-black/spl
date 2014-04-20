@@ -21,6 +21,81 @@
  * CDDL HEADER END
  */
 
+// The allocator in this file is an example of a slice allocator.
+// It works by claiming large blocks of memory from an underlying
+// slow allocator, and retaining this memory for as long as the
+// application can plausably require it. By nature slice allocators
+// are fast, non-fragmenting, and potentially quite space inefficient
+// depending on the size of the allocations from the calling application.
+//
+// A memory pool contains ready to use blocks of memory. These are
+// periodically garbage collected and returned to the underlying
+// allocator after a certain age.
+//
+// The allocator contains a number of Slice Allocators, which in
+// turn have three collections of Slices. Slices are claimed from
+// the memory pool and returned there if they become unused.
+//
+// The Slice Allocator tracks the state of the Slices by placing them
+// in one of three lists, free, partial, and full. Allocations are made
+// from slices in the partial list. If a slice becomes full it is
+// moved to the full list. If there are no partial slices available
+// the next available free slice is moved from the free list into
+// the partial list. When memory is freed from the slices they
+// move from the full list, into the partial list, and ultimately
+// into the free list depending on how many allocations have been
+// taken from the slice.
+//
+// Slices are blocks of memory that have been claimed from the memory
+// pool. They have a header which contains some basic state, and
+// a list node to allow the slice to be moved into a linked list of
+// Slices. The remainder of the Slice is divided into rows of memory
+// that can be allocated to an application. The Slice contains
+// a single linked list of free rows. Allocating a row is as simple
+// a removing the list head. Freeing inserts the freed row at
+// the list head.
+//
+// The Slice rows consist of a header and a block of bytes which
+// are the memory allocated to the application. The header constists
+// of a pointer to the Slice header and a next pointer allowing
+// the row to be inserted into the Slices free lists. The header
+// pointer is there to eliminate the need to search backwards
+// in memory from the row to the slice header when memory is
+// being freed (this search can be very slow).
+//
+// The allocator must be initialised by calling bmalloc_init()
+// before any attempts to allocate memory are made. The allocator
+// can release all free memory on an emergency basis
+// by calling bmalloc_release_memory(). The allocator requires
+// periodic garbage collecting to migrate free blocks
+// of memory from the Slice free lists, to the Memory Pool, to
+// the underlying allocator - by calling bmalloc_garbage_collect().
+//
+
+// The allocator is by its nature quite space inefficient.
+// defining SPACE_EFFICIENT will swap some 64 bit pointers
+// inside the Slices for 32 bit offsets, and some additional
+// pointer arithmetic. Better space efficiency for lower
+// performance.
+//
+// It seems that the performance penalty is about 4% on a
+// user space instrumentation tool, apparently within the
+// margin for error when running iozone.
+#define SPACE_EFFICIENT 1
+
+// Place the allocator in thread safe mode. If you have an application
+// where the allocator does not have to be thread safe then removing
+// the mutexes will improve the allocator performance by about 30%.
+#define THREAD_SAFE 1
+
+// Enable/Disable fine grained locking strategy in the memory
+// The performance benefits of this are not measurable.
+#define MEM_POOL_FINE_LOCKING 1
+
+// Enables finer grained locking in the slice allocator
+// Performance change not measurable.
+#define SLICE_ALLOCATOR_FINE_LOCKING 1
+
 #ifdef _KERNEL
 #define IN_KERNEL 1
 #else
@@ -31,13 +106,13 @@
 #include <string.h>
 
 #ifdef IN_KERNEL
-    #include <sys/list.h>
+#include <sys/list.h>
 #else
-    #include <stdlib.h>
-    #include <sys/time.h>
-    #include <stdio.h>
-    #include "list.h"
-    #include "pthread.h"
+#include <stdlib.h>
+#include <sys/time.h>
+#include <stdio.h>
+#include "list.h"
+#include "pthread.h"
 #endif
 
 // ============================================================================================
@@ -60,10 +135,13 @@ typedef pthread_mutex_t osif_mutex;
 #define SA_TRUE (sa_bool_t)1;
 #define SA_FALSE (sa_bool_t)0;
 
-#define SA_NSEC_PER_SEC  1000000000;
-#define SA_NSEC_PER_USEC  1000;
+#ifdef IN_KERNEL
+#define SA_NSEC_PER_SEC  NSEC_PER_SEC
+#else
+#define SA_NSEC_PER_SEC  1000000000ULL
+#endif
 
-typedef enum {SMALL_BLOCK, LARGE_BLOCK} block_size_t;
+#define SA_NSEC_PER_USEC  1000;
 
 typedef struct {
     sa_hrtime_t time_freed;
@@ -77,40 +155,25 @@ typedef struct {
 } memory_block_list_t;
 
 typedef struct {
-    sa_size_t           amount_allocated;
     memory_block_list_t large_blocks;
-    memory_block_list_t small_blocks;
 } memory_pool_t;
 
-typedef struct small_allocatable_row {
-    small_offset_t slice_offset;
-    small_offset_t next_offset;
-    // FIXME - these should not be needed
-    // and are present because of an issue
-    // somewhere in the small slice
-    // path.
-    small_offset_t pad1;
-    small_offset_t pad2;
-} small_allocatable_row_t;
-
 typedef struct allocatable_row {
+#ifdef SPACE_EFFICIENT
     large_offset_t slice_offset;
     large_offset_t next_offset;
+#else
+    struct slice* slice;
+    struct allocatable_row* next;
+#endif
 } allocatable_row_t;
 
-typedef union {
-    small_allocatable_row_t* small;
-    allocatable_row_t* large;
-} free_list_t;
-
-// This stucture describes the header of a slice_t.
 typedef struct slice {
-    free_list_t  free_list;
+    allocatable_row_t* free_list;
     sa_size_t    allocation_size;
     sa_size_t    num_allocations;
     sa_size_t    alloc_count;
     sa_hrtime_t  time_freed;
-    block_size_t block_size;
     list_node_t  slice_link_node;
 } slice_t;
 
@@ -118,9 +181,8 @@ typedef struct {
     list_t       free;
     list_t       partial;
     list_t       full;
-    block_size_t block_size;
-    sa_size_t    max_alloc_size;        /*  Max alloc size for slice */
-    sa_size_t    num_allocs_per_buffer; /* Number of rows to be allocated in the Slices */
+    sa_size_t    max_alloc_size;       /* Max alloc size for slice */
+    sa_size_t    num_allocs_per_slice; /* Number of rows to be allocated in the Slices */
     osif_mutex   mutex;
 } slice_allocator_t;
 
@@ -133,7 +195,9 @@ typedef struct {
 const sa_size_t RETAIN_MEMORY_SIZE = 10 * 1024 * 1024;   // bytes
 
 // Block size and free block count for the large_blocks list
-const sa_size_t LARGE_BLOCK_SIZE = (512 * 1024) + 8192;  // bytes
+// NOTE: This value must be larger than the largets
+//       configured Slice Allocator max_allocation_size
+const sa_size_t LARGE_BLOCK_SIZE = (128 * 1024) + 4096;  // bytes
 const sa_size_t LARGE_FREE_MEMORY_BLOCK_COUNT =
 RETAIN_MEMORY_SIZE / LARGE_BLOCK_SIZE;
 
@@ -142,19 +206,20 @@ const sa_size_t SMALL_BLOCK_SIZE = 64 * 1024;            // bytes
 const sa_size_t SMALL_FREE_MEMORY_BLOCK_COUNT =
 RETAIN_MEMORY_SIZE / SMALL_BLOCK_SIZE;
 
-// Length of time that memory will be retained in the block_lists
-// before returning to the underlying allocator.
-const sa_hrtime_t MAX_FREE_MEM_AGE = 60 * SA_NSEC_PER_SEC;     // 60 seconds
-
 // Slices of memory that have no allocations in them will
 // be returned to the memory pool for use by other slice
-// allocators SA_MAX_FREEMEM_AGE nanoseconds after
-// the last allocation from the slice is freed.
-const sa_hrtime_t SA_MAX_FREE_MEM_AGE = 30 * SA_NSEC_PER_SEC;
+// allocators. SA_MAX_POOL_FREE_MEM_AGE after being placed
+// in the pool, if not claimed by a slice, the memory
+// is released to the underlying alloctor.
+const sa_hrtime_t SA_MAX_POOL_FREE_MEM_AGE = 120 * SA_NSEC_PER_SEC;
 
-// These buckets of up to SMALL_ALLOCATOR_MAX_SIZE are all
-// allocated from more space efficient small allocation slices.
-const sa_size_t SMALL_ALLOCATOR_MAX_SIZE = 0; //2048; 
+// Once there are no remaining allocations from a slice of memory
+// the Slice Allocator places the slice on its free list.
+// If no allocations are made from the slice within
+// SA_MAX_SLICE_FREE_MEM_AGE seconds, the slice is
+// released to the memory pool for allocation
+// by another slice allocator or release to the underlying allocator.
+const sa_hrtime_t SA_MAX_SLICE_FREE_MEM_AGE = 5 * SA_NSEC_PER_SEC;
 
 // Sizes of various slices that are used by zfs
 // This table started out as a naive ^2 table,
@@ -164,17 +229,12 @@ const sa_size_t SMALL_ALLOCATOR_MAX_SIZE = 0; //2048;
 // requests to slice size.
 
 const sa_size_t ALLOCATOR_SLICE_SIZES[] = {
-    16,
     32,
-    48,
     64,
-    80,
     96,
     128,
-    144,
     160,
     196,
-    224,
     256,
     320,
     384,
@@ -221,9 +281,6 @@ slice_allocator_t* allocators = 0;
 
 // Allocation size to slice allocator lookup table
 slice_allocator_t** allocator_lookup_table = 0;
-
-// Indicates if the allocator has been initialised.
-int initalised = 0;
 
 // ============================================================================================
 // OS Compatability interface
@@ -292,46 +349,45 @@ static inline void osif_zero_memory(void* buf, sa_size_t size)
 
 static inline void osif_mutex_init(osif_mutex* mutex)
 {
+#ifdef THREAD_SAFE
 #ifdef IN_KERNEL
     mutex_init(mutex, "bmalloc", MUTEX_DEFAULT, NULL);
 #else
     pthread_mutex_init(mutex, 0);
 #endif
+#endif
 }
 
 static inline void osif_mutex_enter(osif_mutex* mutex)
 {
+#ifdef THREAD_SAFE
 #ifdef IN_KERNEL
     mutex_enter(mutex);
 #else
     pthread_mutex_lock(mutex);
 #endif
+#endif
 }
 
 static inline void osif_mutex_exit(osif_mutex* mutex)
 {
+#ifdef THREAD_SAFE
 #ifdef IN_KERNEL
     mutex_exit(mutex);
 #else
     pthread_mutex_unlock(mutex);
 #endif
+#endif
 }
 
 static inline void osif_mutex_destroy(osif_mutex* mutex)
 {
+#ifdef THREAD_SAFE
 #ifdef IN_KERNEL
     mutex_destroy(mutex);
 #else
     pthread_mutex_destroy(mutex);
 #endif
-}
-
-static inline  int osif_memory_pressure()
-{
-#ifdef IN_KERNEL
-    return vm_pool_low();
-#else
-    return 0;
 #endif
 }
 
@@ -364,41 +420,24 @@ void memory_pool_block_list_init(memory_block_list_t* list)
 void memory_pool_block_list_fini(memory_block_list_t* list)
 {
     list_destroy(&list->blocks);
-    // FIXME - seems to panic
-    // osif_mutex_destroy(list->mutex);
+    // FIXME - despite the & this still panics.
+    //osif_mutex_destroy(&list->mutex);
 }
 
 void memory_pool_init()
 {
-    pool.amount_allocated = 0;
     memory_pool_block_list_init(&pool.large_blocks);
-    memory_pool_block_list_init(&pool.small_blocks);
 }
 
-memory_block_t* memory_pool_create_block(block_size_t size)
+static inline sa_size_t memory_pool_claim_size()
 {
-    sa_size_t allocation_size = (size == SMALL_BLOCK) ? SMALL_BLOCK_SIZE : LARGE_BLOCK_SIZE;
-    
-    pool.amount_allocated += allocation_size;
-    memory_block_t* block = (memory_block_t*)osif_malloc(allocation_size);
-    return block;
+    return LARGE_BLOCK_SIZE;
 }
 
-void memory_pool_destroy_block(block_size_t size, memory_block_t* block)
+void memory_pool_release_memory()
 {
-    sa_size_t allocation_size = (size == SMALL_BLOCK) ? SMALL_BLOCK_SIZE : LARGE_BLOCK_SIZE;
-    
-    pool.amount_allocated -= allocation_size;
-    osif_free((void*)block, allocation_size);
-}
+    memory_block_list_t* list = &pool.large_blocks;
 
-sa_size_t memory_pool_claim_size(block_size_t size)
-{
-    return (size == SMALL_BLOCK) ? SMALL_BLOCK_SIZE : LARGE_BLOCK_SIZE;
-}
-
-void memory_pool_release_memory_from(block_size_t size, memory_block_list_t* list)
-{
     osif_mutex_enter(&list->mutex);
     
     while(!list_is_empty(&list->blocks)) {
@@ -406,36 +445,47 @@ void memory_pool_release_memory_from(block_size_t size, memory_block_list_t* lis
         list_remove_head(&list->blocks);
         list->count--;
         
-        memory_pool_destroy_block(size, block);
+#ifdef MEM_POOL_FINE_LOCKING
+        osif_mutex_exit(&list->mutex);
+#endif
+        
+        osif_free(block, LARGE_BLOCK_SIZE);
+        
+#ifdef MEM_POOL_FINE_LOCKING
+        osif_mutex_enter(&list->mutex);
+#endif
     }
     
     osif_mutex_exit(&list->mutex);
 }
 
-void memory_pool_release_memory()
+void memory_pool_garbage_collect()
 {
-    memory_pool_release_memory_from(LARGE_BLOCK, &pool.large_blocks);
-    memory_pool_release_memory_from(SMALL_BLOCK, &pool.small_blocks);
-}
+    memory_block_list_t* list = &pool.large_blocks;
 
-void memory_pool_garbage_collect_from(block_size_t size, memory_block_list_t* list)
-{
     osif_mutex_enter(&list->mutex);
     
-    sa_hrtime_t stale_time = osif_gethrtime() - MAX_FREE_MEM_AGE;
-    sa_size_t num_blocks_to_retain = (size == SMALL_BLOCK) ? SMALL_FREE_MEMORY_BLOCK_COUNT : LARGE_FREE_MEMORY_BLOCK_COUNT;
-    
+    sa_hrtime_t stale_time = osif_gethrtime() - SA_MAX_POOL_FREE_MEM_AGE;
     int done = 0;
     
     do {
-        if (list->count <= num_blocks_to_retain) {
+        if (list->count <= LARGE_FREE_MEMORY_BLOCK_COUNT) {
             done = 1;
         } else {
             memory_block_t* block = list_tail(&list->blocks);
             if(block->time_freed <= stale_time) {
                 list_remove_tail(&list->blocks);
                 list->count--;
-                memory_pool_destroy_block(size, block);
+                
+#ifdef MEM_POOL_FINE_LOCKING
+                osif_mutex_exit(&list->mutex);
+#endif
+                
+                osif_free(block, LARGE_BLOCK_SIZE);
+                
+#ifdef MEM_POOL_FINE_LOCKING
+                osif_mutex_enter(&list->mutex);
+#endif
             } else {
                 done = 1;
             }
@@ -445,17 +495,10 @@ void memory_pool_garbage_collect_from(block_size_t size, memory_block_list_t* li
     osif_mutex_exit(&list->mutex);
 }
 
-void memory_pool_garbage_collect()
-{
-    memory_pool_garbage_collect_from(LARGE_BLOCK, &pool.large_blocks);
-    memory_pool_garbage_collect_from(SMALL_BLOCK, &pool.small_blocks);
-}
-
-void* memory_pool_claim(block_size_t size)
+void* memory_pool_claim()
 {
     memory_block_t* block = 0;
-    memory_block_list_t* list =
-    (size == SMALL_BLOCK) ? &pool.small_blocks : &pool.large_blocks;
+    memory_block_list_t* list = &pool.large_blocks;
     
     osif_mutex_enter(&list->mutex);
     
@@ -463,20 +506,21 @@ void* memory_pool_claim(block_size_t size)
         block = list_tail(&list->blocks);
         list_remove_tail(&list->blocks);
         list->count--;
-    } else {
-        block = memory_pool_create_block(size);
     }
     
     osif_mutex_exit(&list->mutex);
     
+    if(!block) {
+        block = (memory_block_t*)osif_malloc(LARGE_BLOCK_SIZE);
+    }
+    
     return (void*)block;
 }
 
-void memory_pool_return(block_size_t size, void* memory)
+void memory_pool_return(void* memory)
 {
     memory_block_t* block = (memory_block_t*)(memory);
-    memory_block_list_t* list =
-    (size == SMALL_BLOCK) ? &pool.small_blocks : &pool.large_blocks;
+    memory_block_list_t* list = &pool.large_blocks;
     
     list_link_init(&block->memory_block_link_node);
     block->time_freed = osif_gethrtime();
@@ -491,169 +535,107 @@ void memory_pool_fini()
 {
     memory_pool_release_memory();
     memory_pool_block_list_fini(&pool.large_blocks);
-    memory_pool_block_list_fini(&pool.small_blocks);
 }
 
 // ============================================================================================
-// Slice
+// Large Slice
 // ============================================================================================
-
-sa_size_t slice_row_size_bytes(slice_t* slice)
-{
-    if (slice->block_size == SMALL_BLOCK) {
-        return slice->allocation_size + sizeof(small_allocatable_row_t);
-    } else {
-        return slice->allocation_size + sizeof(allocatable_row_t);
-    }
-}
-
-static inline void set_slice_small(small_allocatable_row_t* row, slice_t* slice)
-{
-    row->slice_offset = (small_offset_t)((sa_byte_t*)(&(row->slice_offset)) - (sa_byte_t*)(slice));
-}
-
-static inline slice_t* get_slice_small(small_allocatable_row_t* row)
-{
-    return (slice_t*)((sa_byte_t*)(&row->slice_offset) - row->slice_offset);
-}
 
 static inline void set_slice(allocatable_row_t* row, slice_t* slice)
 {
+#ifdef SPACE_EFFICIENT
     row->slice_offset = (large_offset_t)((sa_byte_t*)(&(row->slice_offset)) - (sa_byte_t*)(slice));
+#else
+    row->slice = slice;
+#endif
 }
 
 static inline slice_t* get_slice(allocatable_row_t* row)
 {
+#ifdef SPACE_EFFICIENT
     return (slice_t*)((sa_byte_t*)(&row->slice_offset) - row->slice_offset);
-}
-
-static inline void set_next_small(small_allocatable_row_t* row, slice_t* base_addr, small_allocatable_row_t* next)
-{
-    if(!next) {
-        row->next_offset = 0;
-    } else {
-        row->next_offset = (small_offset_t)((sa_byte_t*)(next) - (sa_byte_t*)(base_addr));
-    }
-}
-
-static inline small_allocatable_row_t* get_next_small(small_allocatable_row_t* row, slice_t* base_addr)
-{
-    if(row->next_offset > 0) {
-        return (small_allocatable_row_t*)((sa_byte_t*)(base_addr) + row->next_offset);
-    } else {
-        return 0;
-    }
+#else
+    return row->slice;
+#endif
 }
 
 static inline void set_next(allocatable_row_t* row, slice_t* base_addr, allocatable_row_t* next)
 {
-    if(!next) {
-        row->next_offset = 0;
-    } else {
+#ifdef SPACE_EFFICIENT
+    if(next) {
         row->next_offset = (large_offset_t)((sa_byte_t*)(next) - (sa_byte_t*)(base_addr));
+    } else {
+        row->next_offset = 0;
     }
+#else
+    row->next = next;
+#endif
+    
 }
 
 static inline allocatable_row_t* get_next(allocatable_row_t* row, slice_t* base_addr)
 {
-    if(row->next_offset > 0) {
+#ifdef SPACE_EFFICIENT
+    if(row->next_offset) {
         return (allocatable_row_t*)((sa_byte_t*)(base_addr) + row->next_offset);
     } else {
         return 0;
     }
-}
-
-small_allocatable_row_t* slice_get_row_address_small(slice_t* slice, int index)
-{
-    sa_byte_t* p = (sa_byte_t*)slice;
-    p = p + sizeof(slice_t) + (index * slice_row_size_bytes(slice));
-    
-    return (small_allocatable_row_t*)(p);
+#else
+    return row->next;
+#endif
 }
 
 allocatable_row_t* slice_get_row_address(slice_t* slice, int index)
 {
     sa_byte_t* p = (sa_byte_t*)slice;
-    p = p + sizeof(slice_t) + (index * slice_row_size_bytes(slice));
+    p = p + sizeof(slice_t) + (index * (slice->allocation_size + sizeof(allocatable_row_t)));
     
     return (allocatable_row_t*)(p);
 }
 
-void slice_insert_free_row_small(slice_t* slice, small_allocatable_row_t* row)
-{
-    small_allocatable_row_t* curr_free = slice->free_list.small;
-    slice->free_list.small = row;
-    set_next_small(slice->free_list.small, slice, curr_free);
-}
-
 void slice_insert_free_row(slice_t* slice, allocatable_row_t* row)
 {
-    allocatable_row_t* curr_free = slice->free_list.large;
-    slice->free_list.large = row;
-    set_next(slice->free_list.large, slice, curr_free);
-}
-
-small_allocatable_row_t* slice_get_row_small(slice_t* slice)
-{
-    if (slice->free_list.small == 0) {
-        return 0;
-    } else {
-        small_allocatable_row_t* row = slice->free_list.small;
-        slice->free_list.small = get_next_small(row, slice);
-        return row;
-    }
+    allocatable_row_t* curr_free = slice->free_list;
+    slice->free_list = row;
+    set_next(slice->free_list, slice, curr_free);
 }
 
 allocatable_row_t* slice_get_row(slice_t* slice)
 {
-    if (slice->free_list.large == 0) {
+    if (slice->free_list == 0) {
         return 0;
     } else {
-        allocatable_row_t* row = slice->free_list.large;
-        slice->free_list.large = get_next(row, slice);
+        allocatable_row_t* row = slice->free_list;
+        slice->free_list = get_next(row, slice);
         return row;
     }
 }
 
 void slice_init(slice_t* slice,
-                block_size_t size,
                 sa_size_t allocation_size,
                 sa_size_t num_allocations)
 {
     // Copy parameters
-    osif_zero_memory(slice, sizeof(slice_t));
+    //osif_zero_memory(slice, sizeof(slice_t));
+    
     list_link_init(&slice->slice_link_node);
+    slice->free_list = 0;
+    slice->alloc_count = 0;
     slice->num_allocations = num_allocations;
     slice->allocation_size = allocation_size;
-    slice->block_size = size;
     
-    // Add all rows to the free list. Set pointers to the slice.
-    if(slice->block_size == SMALL_BLOCK) {
-        for(int i=0; i < slice->num_allocations; i++) {
-            small_allocatable_row_t* row = slice_get_row_address_small(slice, i);
-            set_slice_small(row, slice);
-            slice_insert_free_row_small(slice, row);
-        }
-    } else {
-        for(int i=0; i < slice->num_allocations; i++) {
-            allocatable_row_t* row = slice_get_row_address(slice, i);
-            set_slice(row, slice);
-            slice_insert_free_row(slice, row);
-        }
+    for(int i=0; i < slice->num_allocations; i++) {
+        allocatable_row_t* row = slice_get_row_address(slice, i);
+        set_slice(row, slice);
+        slice_insert_free_row(slice, row);
     }
-}
-
-void slice_fini(slice_t* slice)
-{
+    
 }
 
 static inline int slice_is_full(slice_t* slice)
 {
-    if (slice->block_size == SMALL_BLOCK) {
-        return (slice->free_list.small == 0);
-    } else {
-        return (slice->free_list.large == 0);
-    }
+    return (slice->free_list == 0);
 }
 
 static inline int slice_is_empty(slice_t* slice)
@@ -663,105 +645,66 @@ static inline int slice_is_empty(slice_t* slice)
 
 void* slice_alloc(slice_t* slice, sa_size_t size)
 {
-    if(slice->block_size == SMALL_BLOCK) {
-        small_allocatable_row_t* row = slice_get_row_small(slice);
-        if(row) {
-            slice->alloc_count++;
-            row++;
-            return (void*)(row);
-        } else {
-            return (void*)0;
-        }
+    allocatable_row_t* row = slice_get_row(slice);
+    if(row) {
+        slice->alloc_count++;
+        row++;
+        return (void*)(row);
     } else {
-        allocatable_row_t* row = slice_get_row(slice);
-        if(row) {
-            slice->alloc_count++;
-            row++;
-            return (void*)(row);
-        } else {
-            return (void*)0;
-        }
+        return (void*)0;
     }
 }
 
-void slice_free(slice_t* slice, void* buf)
+static inline void slice_free_row(slice_t* slice, allocatable_row_t* row)
 {
-    if (slice->block_size == SMALL_BLOCK) {
-        slice->alloc_count--;
-        small_allocatable_row_t* row = (small_allocatable_row_t*)(buf);
-        row--;
-        slice_insert_free_row_small(slice, row);
-    } else {
-        slice->alloc_count--;
-        allocatable_row_t* row = (allocatable_row_t*)(buf);
-        row--;
-        slice_insert_free_row(slice, row);
-    }
+    slice->alloc_count--;
+    slice_insert_free_row(slice, row);
 }
 
-slice_t* slice_get_slice_small(void* buf)
+static inline slice_t* slice_get_slice_from_row(void* buf, allocatable_row_t** row)
 {
-    small_allocatable_row_t* row = (small_allocatable_row_t*)(buf);
-    row--;
-    return get_slice_small(row);
-}
-
-slice_t* slice_get_slice(void* buf)
-{
-    allocatable_row_t* row = (allocatable_row_t*)(buf);
-    row--;
-    return get_slice(row);
+    (*row) = (allocatable_row_t*)(buf);
+    (*row)--;
+    return get_slice(*row);
 }
 
 // ============================================================================================
 // Slice Allocator
 // ============================================================================================
 
-static inline slice_t* slice_allocator_create_slice(slice_allocator_t* sa)
-{
-    slice_t* slice = (slice_t*)memory_pool_claim(sa->block_size);
-    slice_init(slice, sa->block_size, sa->max_alloc_size, sa->num_allocs_per_buffer);
-    return slice;
-}
-
-static inline void slice_allocator_destroy_slice(slice_allocator_t* sa, slice_t* slice)
-{
-    memory_pool_return(sa->block_size, slice);
-}
-
 void slice_allocator_empty_list(slice_allocator_t* sa, list_t* list)
 {
+    osif_mutex_enter(&sa->mutex);
+    
     while(!list_is_empty(list)) {
         slice_t* slice = list_head(list);
         list_remove_head(list);
-        slice_allocator_destroy_slice(sa, slice);
-    }
+
+#ifdef SLICE_ALLOCATOR_FINE_LOCKING
+        osif_mutex_exit(&sa->mutex);
+#endif
+        memory_pool_return(slice);
+
+#ifdef SLICE_ALLOCATOR_FINE_LOCKING
+        osif_mutex_enter(&sa->mutex);
+#endif
+}
+    
+    osif_mutex_exit(&sa->mutex);
 }
 
 void slice_allocator_init(slice_allocator_t* sa, sa_size_t max_alloc_size)
 {
     osif_zero_memory(sa, sizeof(slice_allocator_t));
+    osif_mutex_init(&sa->mutex);
     
     // Create lists for tracking the state of the slices as memory is allocated
     list_create(&sa->free, sizeof(slice_t), offsetof(slice_t, slice_link_node));
     list_create(&sa->partial, sizeof(slice_t), offsetof(slice_t, slice_link_node));
     list_create(&sa->full, sizeof(slice_t), offsetof(slice_t, slice_link_node));
     
-    // Set Block size based om allocation size
-    sa->block_size =
-    (max_alloc_size <= SMALL_ALLOCATOR_MAX_SIZE) ? SMALL_BLOCK : LARGE_BLOCK;
-    
     sa->max_alloc_size = max_alloc_size;
-    
-    // Calculate the number of allocations that will fit into a standard
-    // memory_pool block
-    if (sa->block_size == SMALL_BLOCK) {
-        sa->num_allocs_per_buffer = (memory_pool_claim_size(SMALL_BLOCK) - sizeof(slice_t))/(sizeof(small_allocatable_row_t) + max_alloc_size);
-    } else {
-        sa->num_allocs_per_buffer = (memory_pool_claim_size(LARGE_BLOCK) - sizeof(slice_t))/(sizeof(allocatable_row_t) + max_alloc_size);
-    }
-    
-    osif_mutex_init(&sa->mutex);
+    sa->num_allocs_per_slice = (memory_pool_claim_size() - sizeof(slice_t))/(sizeof(allocatable_row_t) + max_alloc_size);
 }
 
 void slice_allocator_fini(slice_allocator_t* sa)
@@ -797,11 +740,20 @@ void* slice_allocator_alloc(slice_allocator_t* sa, sa_size_t size)
         list_remove_tail(&sa->free);
         list_insert_head(&sa->partial, slice);
     } else {
-        slice = slice_allocator_create_slice(sa);
+
+#ifdef SLICE_ALLOCATOR_FINE_LOCKING
+        osif_mutex_exit(&sa->mutex);
+#endif
+        
+        slice = (slice_t*)memory_pool_claim();
+        slice_init(slice, sa->max_alloc_size, sa->num_allocs_per_slice);
+
+#ifdef SLICE_ALLOCATOR_FINE_LOCKING
+        osif_mutex_enter(&sa->mutex);
+#endif
+        
         list_insert_head(&sa->partial, slice);
     }
-    
-    // FIXME: we might crash here if slice_allocator_create_slice returns null.
     
     // Grab memory from the slice
     void *p = slice_alloc(slice, size);
@@ -826,11 +778,8 @@ void slice_allocator_free(slice_allocator_t* sa, void* buf)
     
     // Locate the slice buffer that the allocation lives within
     slice_t* slice;
-    if (sa->block_size == SMALL_BLOCK) {
-        slice = slice_get_slice_small(buf);
-    } else {
-        slice = slice_get_slice(buf);
-    }
+    allocatable_row_t* row;
+    slice = slice_get_slice_from_row(buf, &row);
     
     // If the slice was previously full remove it from the free list
     // and place in the available list
@@ -839,8 +788,9 @@ void slice_allocator_free(slice_allocator_t* sa, void* buf)
         list_insert_head(&sa->partial, slice);
     }
     
-    slice_free(slice, buf);
+    slice_free_row(slice, row);
     
+    // Finally migrate to the free list if needed.
     if(slice_is_empty(slice)) {
         list_remove(&sa->partial, slice);
         slice->time_freed = osif_gethrtime();
@@ -852,16 +802,14 @@ void slice_allocator_free(slice_allocator_t* sa, void* buf)
 
 void slice_allocator_release_memory(slice_allocator_t* sa)
 {
-    osif_mutex_enter(&sa->mutex);
     slice_allocator_empty_list(sa, &sa->free);
-    osif_mutex_exit(&sa->mutex);
 }
 
 void slice_allocator_garbage_collect(slice_allocator_t* sa)
 {
     osif_mutex_enter(&sa->mutex);
     
-    sa_hrtime_t stale_time = osif_gethrtime() - SA_MAX_FREE_MEM_AGE;
+    sa_hrtime_t stale_time = osif_gethrtime() - SA_MAX_SLICE_FREE_MEM_AGE;
     
     int done = 0;
     
@@ -870,7 +818,16 @@ void slice_allocator_garbage_collect(slice_allocator_t* sa)
             slice_t* slice = list_tail(&sa->free);
             if(slice->time_freed <= stale_time) {
                 list_remove_tail(&sa->free);
-                slice_allocator_destroy_slice(sa, slice);
+                
+#ifdef SLICE_ALLOCATOR_FINE_LOCKING
+                osif_mutex_exit(&sa->mutex);
+#endif
+                
+                memory_pool_return(slice);
+                
+#ifdef SLICE_ALLOCATOR_FINE_LOCKING
+                osif_mutex_enter(&sa->mutex);
+#endif
             } else {
                 done = 1;
             }
@@ -894,9 +851,9 @@ static inline sa_size_t bmalloc_allocator_array_size()
 slice_allocator_t* bmalloc_allocator_for_size(sa_size_t size)
 {
     for(int i=0; i<NUM_ALLOCATORS; i++) {
-      if (slice_allocator_get_allocation_size(&allocators[i]) >= size) {
-        return &allocators[i];
-      }
+        if (slice_allocator_get_allocation_size(&allocators[i]) >= size) {
+            return &allocators[i];
+        }
     }
     
     return (void*)0;
@@ -912,7 +869,7 @@ void bmalloc_init()
     printf("[SPL] bmalloc slice allocator initialised\n");
 
     sa_size_t max_allocation_size = ALLOCATOR_SLICE_SIZES[NUM_ALLOCATORS - 1];
-
+    
     // Initialise the memory pool
     memory_pool_init();
     
@@ -931,8 +888,6 @@ void bmalloc_init()
     for(int i=1; i<=max_allocation_size; i++) {
         allocator_lookup_table[i-1] = bmalloc_allocator_for_size(i);
     }
-    
-    initalised = 1;
 }
 
 void bmalloc_fini()
@@ -949,8 +904,6 @@ void bmalloc_fini()
     
     // Clean up the memory pool
     memory_pool_fini();
-    
-    initalised = 0;
 }
 
 void* bmalloc(sa_size_t size)
@@ -980,7 +933,7 @@ void bmalloc_release_memory()
     for(int i=0; i<NUM_ALLOCATORS; i++) {
         slice_allocator_release_memory(&allocators[i]);
     }
-
+    
     memory_pool_release_memory();
 }
 
@@ -989,6 +942,6 @@ void bmalloc_garbage_collect()
     for(int i=0; i<NUM_ALLOCATORS; i++) {
         slice_allocator_garbage_collect(&allocators[i]);
     }
-
+    
     memory_pool_garbage_collect();
 }
